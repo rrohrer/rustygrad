@@ -73,6 +73,17 @@ impl Value {
             value.children.1.clone(),
         )];
 
+        // zero out the all children
+        let mut zero_nodes = vec![value.children.0.clone(), value.children.1.clone()];
+        while !zero_nodes.is_empty() {
+            if let Some(node) = zero_nodes.pop().unwrap_or(None) {
+                node.set_grad(0.0);
+                let (a, b) = node.children();
+                zero_nodes.push(a);
+                zero_nodes.push(b);
+            }
+        }
+
         // loop over all of the children and calculate their gradients
         while !nodes.is_empty() {
             let (op, grad, a, b) = nodes.pop().unwrap();
@@ -87,8 +98,8 @@ impl Value {
                     let b = b.unwrap();
 
                     // set grad for A and B
-                    a.set_grad(grad);
-                    b.set_grad(grad);
+                    a.accumulate_grad(grad);
+                    b.accumulate_grad(grad);
 
                     // push A and B onto the stack for processing.
                     let (ac1, ac2) = a.children();
@@ -102,8 +113,8 @@ impl Value {
                     let b = b.unwrap();
 
                     // update the gradients for A and B
-                    a.set_grad(b.data() * grad);
-                    b.set_grad(a.data() * grad);
+                    a.accumulate_grad(b.data() * grad);
+                    b.accumulate_grad(a.data() * grad);
 
                     // push A and B onto the stack for processing.
                     let (ac1, ac2) = a.children();
@@ -114,7 +125,7 @@ impl Value {
                 ValueOp::TanH => {
                     let a = a.unwrap();
                     let ddx = ddx_tanh(a.data());
-                    a.set_grad(grad * ddx);
+                    a.accumulate_grad(grad * ddx);
                     let (ac1, ac2) = a.children();
                     nodes.push((a.op(), a.grad(), ac1, ac2));
                 }
@@ -124,6 +135,10 @@ impl Value {
 
     pub fn set_grad(&self, grad: f32) {
         self.data.borrow_mut().grad = grad;
+    }
+
+    pub fn accumulate_grad(&self, grad: f32) {
+        self.data.borrow_mut().grad += grad;
     }
 
     pub fn grad(&self) -> f32 {
@@ -274,4 +289,28 @@ fn value_backward_tanh() {
     assert_eq!(w2.grad(), 0.0);
     assert_eq!(b.grad(), 0.50000715);
     assert_eq!(n.grad(), 0.50000715);
+}
+
+#[test]
+fn value_backward_multi_connected() {
+    let a = Value::from(3.0);
+    let b = a.clone() + a.clone();
+
+    b.backward();
+
+    assert_eq!(a.grad(), 2.0);
+}
+
+#[test]
+fn value_backward_multi_connected_complex() {
+    let a = Value::from(-2.0);
+    let b = Value::from(3.0);
+    let d = a.clone() * b.clone();
+    let e = a.clone() + b.clone();
+    let f = d.clone() * e.clone();
+
+    f.backward();
+
+    assert_eq!(a.grad(), -3.0);
+    assert_eq!(b.grad(), -8.0);
 }
