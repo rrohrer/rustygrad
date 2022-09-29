@@ -8,6 +8,9 @@ pkgs.mkShell {
     rust-analyzer
     clippy
     trunk
+    clang
+    libiconv
+    gitMinimal
   ];
 
   RUST_BACKTRACE = 1;
