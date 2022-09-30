@@ -9,6 +9,8 @@ enum ValueOp {
     Add,
     Mul,
     TanH,
+    Exp,
+    Pow(f32),
 }
 
 #[derive(Debug)]
@@ -55,6 +57,16 @@ impl Value {
             data: Rc::new(RefCell::new(ValueData::new(
                 tanh(self.data()),
                 Some(ValueOp::TanH),
+                (Some(self.clone()), None),
+            ))),
+        }
+    }
+
+    pub fn exp(&self) -> Value {
+        Value {
+            data: Rc::new(RefCell::new(ValueData::new(
+                self.data().exp(),
+                Some(ValueOp::Exp),
                 (Some(self.clone()), None),
             ))),
         }
@@ -129,6 +141,19 @@ impl Value {
                     let (ac1, ac2) = a.children();
                     nodes.push((a.op(), a.grad(), ac1, ac2));
                 }
+                ValueOp::Exp => {
+                    let a = a.unwrap();
+                    a.accumulate_grad(a.data().exp() * grad);
+                    let (ac1, ac2) = a.children();
+                    nodes.push((a.op(), a.grad(), ac1, ac2));
+                }
+                ValueOp::Pow(n) => {
+                    let a = a.unwrap();
+                    let grad = n * a.data().powf(n - 1.0) * grad;
+                    a.accumulate_grad(grad);
+                    let (ac1, ac2) = a.children();
+                    nodes.push((a.op(), a.grad(), ac1, ac2));
+                }
             }
         }
     }
@@ -168,6 +193,22 @@ impl ops::Add<Value> for Value {
     }
 }
 
+impl ops::Add<f32> for Value {
+    type Output = Value;
+
+    fn add(self, rhs: f32) -> Self::Output {
+        self + Value::from(rhs)
+    }
+}
+
+impl ops::Add<Value> for f32 {
+    type Output = Value;
+
+    fn add(self, rhs: Value) -> Self::Output {
+        rhs + Value::from(self)
+    }
+}
+
 impl ops::Mul<Value> for Value {
     type Output = Value;
 
@@ -179,6 +220,77 @@ impl ops::Mul<Value> for Value {
                 (Some(self), Some(rhs)),
             ))),
         }
+    }
+}
+
+impl ops::Mul<f32> for Value {
+    type Output = Value;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        self * Value::from(rhs)
+    }
+}
+
+impl ops::Mul<Value> for f32 {
+    type Output = Value;
+
+    fn mul(self, rhs: Value) -> Self::Output {
+        rhs * Value::from(self)
+    }
+}
+
+impl ops::Sub<Value> for Value {
+    type Output = Value;
+
+    fn sub(self, rhs: Value) -> Self::Output {
+        self + (-rhs)
+    }
+}
+
+impl ops::Sub<f32> for Value {
+    type Output = Value;
+
+    fn sub(self, rhs: f32) -> Self::Output {
+        self - Value::from(rhs)
+    }
+}
+
+impl ops::Sub<Value> for f32 {
+    type Output = Value;
+
+    fn sub(self, rhs: Value) -> Self::Output {
+        Value::from(self) - rhs
+    }
+}
+
+impl ops::Neg for Value {
+    type Output = Value;
+
+    fn neg(self) -> Self::Output {
+        self * -1.0
+    }
+}
+
+impl ops::BitXor<f32> for Value {
+    type Output = Value;
+
+    fn bitxor(self, rhs: f32) -> Self::Output {
+        Value {
+            data: Rc::new(RefCell::new(ValueData::new(
+                self.data().powf(rhs),
+                Some(ValueOp::Pow(rhs)),
+                (Some(self), None),
+            ))),
+        }
+    }
+}
+
+/// Defining division this way because it makes the derivative easy.
+impl ops::Div<Value> for Value {
+    type Output = Value;
+
+    fn div(self, rhs: Value) -> Self::Output {
+        self * (rhs ^ -1.0)
     }
 }
 
@@ -196,8 +308,7 @@ fn ddx_tanh(x: f32) -> f32 {
 
 #[test]
 fn value_init() {
-    let value = Value::from(42.0);
-    println!("{:?}", value);
+    _ = Value::from(42.0);
 }
 
 #[test]
@@ -206,7 +317,6 @@ fn value_add() {
     let b = Value::from(11.0);
     let c = a + b;
     assert_eq!(c.data(), 21.0);
-    println!("{:?}", c)
 }
 
 #[test]
@@ -215,7 +325,6 @@ fn value_mul() {
     let b = Value::from(3.0);
     let c = a * b;
     assert_eq!(c.data(), 6.0);
-    println!("{:?}", c);
 }
 
 #[test]
@@ -231,14 +340,6 @@ fn value_backward() {
     let loss = d.clone() * f.clone();
 
     loss.backward();
-
-    println!("a grad: {}", a.grad());
-    println!("b grad: {}", b.grad());
-    println!("c grad: {}", c.grad());
-    println!("d grad: {}", d.grad());
-    println!("e grad: {}", e.grad());
-    println!("f grad: {}", f.grad());
-    println!("loss grad: {}", loss.grad());
 
     assert_eq!(a.grad(), 6.0);
     assert_eq!(b.grad(), -4.0);
@@ -270,6 +371,43 @@ fn value_backward_tanh() {
 
     // use tanh as the activation function for the output of this graph.
     let output = n.tanh();
+
+    output.backward();
+
+    assert_eq!(x1.grad(), -1.5000215);
+    assert_eq!(x2.grad(), 0.50000715);
+    assert_eq!(w1.grad(), 1.0000143);
+    assert_eq!(w2.grad(), 0.0);
+    assert_eq!(b.grad(), 0.50000715);
+    assert_eq!(n.grad(), 0.50000715);
+}
+
+#[test]
+fn value_backward_tanh_parts() {
+    // taken from above video at 1:18:05
+    // inputs
+    let x1 = Value::from(2.0);
+    let x2 = Value::from(0.0);
+
+    // weights
+    let w1 = Value::from(-3.0);
+    let w2 = Value::from(1.0);
+
+    // bias of the neuron
+    let b = Value::from(6.8813635870195432);
+
+    // compute x1*w1 + x2*w2 + b
+    let x1w1 = x1.clone() * w1.clone();
+    let x2w2 = x2.clone() * w2.clone();
+    let n = x1w1.clone() + x2w2.clone() + b.clone();
+
+    // use tanh as the activation function for the output of this graph.
+    // except in this test its hand made to test other operations.
+    println!("n: {}", n.data());
+    let e = (2.0 * n.clone()).exp();
+    println!("e: {}", e.data());
+    let output = (e.clone() - 1.0) / (e.clone() + 1.0);
+    println!("output: {}", output.data());
 
     output.backward();
 
