@@ -450,6 +450,10 @@ fn value_backward_tanh_div() {
     let output = (e.clone() - 1.0) / (e.clone() + 1.0);
 
     output.backward();
+
+    assert_eq!(n.grad(), 0.5000072);
+    assert_eq!(e.grad(), 0.042894714);
+    assert_eq!(output.data(), 0.7071017);
 }
 
 #[test]
@@ -505,5 +509,6 @@ fn value_backward_div() {
 
     c.backward();
 
-    println!("c: {} a.grad: {} b.grad: {}", c.data(), a.grad(), b.grad());
+    assert_eq!(a.grad(), 0.5);
+    assert_eq!(b.grad(), -1.0);
 }
