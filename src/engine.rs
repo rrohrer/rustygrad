@@ -19,6 +19,7 @@ struct ValueData {
     grad: f32,
     op: Option<ValueOp>,
     children: (Option<Value>, Option<Value>),
+    visited: bool,
 }
 
 impl ValueData {
@@ -32,6 +33,7 @@ impl ValueData {
             grad: 0.0,
             op,
             children,
+            visited: false,
         }
     }
 }
@@ -72,90 +74,115 @@ impl Value {
         }
     }
 
+    fn visited(&self) -> bool {
+        self.data.deref().borrow().visited
+    }
+
+    fn set_visited(&self, visited: bool) {
+        self.data.borrow_mut().visited = visited;
+    }
+
     pub fn backward(&self) {
-        // sneaky sneaky borrow the graph as mut
-        let mut value = self.data.borrow_mut();
+        // this function sets all the gradients to zero too, totally preparing for the
+        // process of back propagation.
+        self.topological_sort()
+            .iter_mut()
+            .rev()
+            .filter(|n| n.op().is_some())
+            .for_each(|node| {
+                let (child_a, child_b) = node.children();
 
-        // calculate the derivative of this node with respect to itself:
-        value.grad = 1.0;
-        let mut nodes = vec![(
-            value.op.clone(),
-            value.grad,
-            value.children.0.clone(),
-            value.children.1.clone(),
-        )];
+                match node.op().unwrap() {
+                    ValueOp::Add => {
+                        child_a.unwrap().accumulate_grad(node.grad());
+                        child_b.unwrap().accumulate_grad(node.grad());
+                    }
+                    ValueOp::Mul => {
+                        let a = child_a.unwrap();
+                        let b = child_b.unwrap();
+                        a.accumulate_grad(b.data() * node.grad());
+                        b.accumulate_grad(a.data() * node.grad());
+                    }
+                    ValueOp::TanH => {
+                        let a = child_a.unwrap();
+                        let ddx = ddx_tanh(a.data());
+                        a.accumulate_grad(ddx * node.grad());
+                    }
+                    ValueOp::Exp => {
+                        let a = child_a.unwrap();
+                        a.accumulate_grad(a.data().exp() * node.grad());
+                    }
+                    ValueOp::Pow(n) => {
+                        let a = child_a.unwrap();
+                        let ddx = n * a.data().powf(n - 1.0);
+                        a.accumulate_grad(ddx * node.grad());
+                    }
+                }
+            });
+    }
 
-        // zero out the all children
-        let mut zero_nodes = vec![value.children.0.clone(), value.children.1.clone()];
-        while !zero_nodes.is_empty() {
-            if let Some(node) = zero_nodes.pop().unwrap_or(None) {
+    fn topological_sort(&self) -> Vec<Value> {
+        let mut result = Vec::new();
+        let mut stack = vec![Some(self.clone())];
+
+        // reset all the nodes to not visited.
+        while !stack.is_empty() {
+            if let Some(node) = stack.pop().unwrap_or(None) {
+                node.set_visited(false);
                 node.set_grad(0.0);
                 let (a, b) = node.children();
-                zero_nodes.push(a);
-                zero_nodes.push(b);
+                stack.push(a);
+                stack.push(b);
+            }
+        }
+        self.set_grad(1.0);
+
+        // helper function to determine if node is edge node
+        let is_edge_node = |node: &Value| {
+            let children = node.children();
+
+            // if child 0 doesn't exist or is visited, set true
+            let a_visited = if let Some(child) = children.0 {
+                child.visited()
+            } else {
+                true
+            };
+
+            // if child b doesn't exist or is visited set true
+            let b_visited = if let Some(child) = children.1 {
+                child.visited()
+            } else {
+                true
+            };
+
+            // if both are true, this node has no children or they are all visited.
+            a_visited && b_visited
+        };
+
+        // do the topological sort
+        stack.push(Some(self.clone()));
+        while !stack.is_empty() {
+            if let Some(node) = stack.pop().unwrap() {
+                let is_edge_node = is_edge_node(&node);
+                let children = node.children();
+                // if its not an edge node, push it back on the stack and process the children.
+                // This does an iterative DFS on the graph (mimicking recursion).
+                if !is_edge_node {
+                    stack.push(Some(node));
+                    if children.0.is_some() {
+                        stack.push(children.0);
+                    }
+                    if children.1.is_some() {
+                        stack.push(children.1);
+                    }
+                } else if !node.visited() {
+                    node.set_visited(true);
+                    result.push(node);
+                }
             }
         }
 
-        // loop over all of the children and calculate their gradients
-        while !nodes.is_empty() {
-            let (op, grad, a, b) = nodes.pop().unwrap();
-            if op.is_none() {
-                continue;
-            }
-
-            match op.unwrap() {
-                ValueOp::Add => {
-                    // copy a and b
-                    let a = a.unwrap();
-                    let b = b.unwrap();
-
-                    // set grad for A and B
-                    a.accumulate_grad(grad);
-                    b.accumulate_grad(grad);
-
-                    // push A and B onto the stack for processing.
-                    let (ac1, ac2) = a.children();
-                    nodes.push((a.op(), a.grad(), ac1, ac2));
-                    let (bc1, bc2) = b.children();
-                    nodes.push((b.op(), b.grad(), bc1, bc2));
-                }
-                ValueOp::Mul => {
-                    // copy A and B
-                    let a = a.unwrap();
-                    let b = b.unwrap();
-
-                    // update the gradients for A and B
-                    a.accumulate_grad(b.data() * grad);
-                    b.accumulate_grad(a.data() * grad);
-
-                    // push A and B onto the stack for processing.
-                    let (ac1, ac2) = a.children();
-                    nodes.push((a.op(), a.grad(), ac1, ac2));
-                    let (bc1, bc2) = b.children();
-                    nodes.push((b.op(), b.grad(), bc1, bc2));
-                }
-                ValueOp::TanH => {
-                    let a = a.unwrap();
-                    let ddx = ddx_tanh(a.data());
-                    a.accumulate_grad(grad * ddx);
-                    let (ac1, ac2) = a.children();
-                    nodes.push((a.op(), a.grad(), ac1, ac2));
-                }
-                ValueOp::Exp => {
-                    let a = a.unwrap();
-                    a.accumulate_grad(a.data().exp() * grad);
-                    let (ac1, ac2) = a.children();
-                    nodes.push((a.op(), a.grad(), ac1, ac2));
-                }
-                ValueOp::Pow(n) => {
-                    let a = a.unwrap();
-                    let grad = n * a.data().powf(n - 1.0) * grad;
-                    a.accumulate_grad(grad);
-                    let (ac1, ac2) = a.children();
-                    nodes.push((a.op(), a.grad(), ac1, ac2));
-                }
-            }
-        }
+        result
     }
 
     pub fn set_grad(&self, grad: f32) {
@@ -403,30 +430,26 @@ fn value_backward_tanh_parts() {
 
     // use tanh as the activation function for the output of this graph.
     // except in this test its hand made to test other operations.
-    println!("n: {}", n.data());
     let e = (2.0 * n.clone()).exp();
-    println!("e: {}", e.data());
     let output = (e.clone() - 1.0) / (e.clone() + 1.0);
-    println!("output: {}", output.data());
 
     output.backward();
 
-    println!("x1 grad: {}", x1.grad());
-    println!("x2 grad: {}", x2.grad());
-    println!("w1 grad: {}", w1.grad());
-    println!("w2 grad: {}", w2.grad());
-    println!("b grad: {}", b.grad());
-    println!("x1w1 grad: {}", x1w1.grad());
-    println!("x2w2 grad: {}", x2w2.grad());
-    println!("n grad: {}", n.grad());
-    println!("output grad: {}", output.grad());
-
-    assert_eq!(x1.grad(), -1.5000215);
-    assert_eq!(x2.grad(), 0.50000715);
-    assert_eq!(w1.grad(), 1.0000143);
+    assert_eq!(x1.grad(), -1.5000217);
+    assert_eq!(x2.grad(), 0.5000072);
+    assert_eq!(w1.grad(), 1.0000144);
     assert_eq!(w2.grad(), 0.0);
-    assert_eq!(b.grad(), 0.50000715);
-    assert_eq!(n.grad(), 0.50000715);
+    assert_eq!(b.grad(), 0.5000072);
+    assert_eq!(n.grad(), 0.5000072);
+}
+
+#[test]
+fn value_backward_tanh_div() {
+    let n = Value::from(0.8813634);
+    let e = (2.0 * n.clone()).exp();
+    let output = (e.clone() - 1.0) / (e.clone() + 1.0);
+
+    output.backward();
 }
 
 #[test]
@@ -451,4 +474,36 @@ fn value_backward_multi_connected_complex() {
 
     assert_eq!(a.grad(), -3.0);
     assert_eq!(b.grad(), -8.0);
+}
+
+#[test]
+fn value_backward_exp() {
+    let a = Value::from(2.0);
+    let b = a.exp();
+
+    b.backward();
+
+    assert_eq!(a.grad(), b.data());
+}
+
+#[test]
+fn value_backward_pow() {
+    let a = Value::from(2.0);
+    let b = a.clone() ^ 3.0;
+
+    b.backward();
+
+    assert_eq!(a.grad(), 12.0);
+    assert_eq!(b.data(), 8.0);
+}
+
+#[test]
+fn value_backward_div() {
+    let a = Value::from(4.0);
+    let b = Value::from(2.0);
+    let c = a.clone() / b.clone();
+
+    c.backward();
+
+    println!("c: {} a.grad: {} b.grad: {}", c.data(), a.grad(), b.grad());
 }
